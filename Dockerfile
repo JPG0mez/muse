@@ -9,9 +9,14 @@ RUN apt-get update \
     tini \
     openssl \
     ca-certificates \
+    python3 \
+    python3-pip \
     && apt-get autoclean \
     && apt-get autoremove \
     && rm -rf /var/lib/apt/lists/*
+
+# Install a recent yt-dlp (Debian packages can be old; PEP 668 requires --break-system-packages)
+RUN python3 -m pip -q install --no-cache-dir --break-system-packages yt-dlp
 
 # Install dependencies
 FROM base AS dependencies

@@ -2,6 +2,7 @@ import {VoiceChannel, Snowflake} from 'discord.js';
 import {Readable} from 'stream';
 import hasha from 'hasha';
 import ytdl, {videoFormat} from '@distube/ytdl-core';
+import {execa} from 'execa';
 import {WriteStream} from 'fs-capacitor';
 import ffmpeg from 'fluent-ffmpeg';
 import shuffle from 'array-shuffle';
@@ -513,57 +514,127 @@ export default class {
 
     ffmpegInput = await this.fileCache.getPathFor(this.getHashForCache(song.url));
 
+    const isYouTube = (() => {
+      try {
+        const u = new URL(song.url);
+        return (
+          u.hostname === 'youtu.be'
+          || u.hostname.endsWith('.youtu.be')
+          || u.hostname === 'youtube.com'
+          || u.hostname.endsWith('.youtube.com')
+          || u.hostname === 'music.youtube.com'
+          || u.hostname.endsWith('.googlevideo.com')
+        );
+      } catch {
+        // Fallback for non-URL inputs
+        return song.url.includes('youtube.com') || song.url.includes('youtu.be') || song.url.includes('googlevideo.com');
+      }
+    })();
+
+    // Muse sometimes stores raw YouTube video IDs (11 chars) instead of full URLs.
+    // Treat those as YouTube and normalize to a full URL for yt-dlp.
+    const looksLikeYouTubeId = /^[a-zA-Z0-9_-]{11}$/.test(song.url);
+    if (looksLikeYouTubeId) {
+      song.url = `https://www.youtube.com/watch?v=${song.url}`;
+    }
+
+    const isYouTubeFinal = isYouTube || looksLikeYouTubeId;
+
+    debug(`[stream] source=${song.source} url=${song.url} isYouTube=${isYouTubeFinal}`);
+
     if (!ffmpegInput) {
-      // Not yet cached, must download
-      const info = await ytdl.getInfo(song.url);
+      if (isYouTubeFinal) {
+        // Prefer yt-dlp for YouTube. ytdl-core URLs often 403 when fetched by ffmpeg.
+        // Direct-URL mode: we only support direct YouTube URLs here.
+        // Most reliable approach: let yt-dlp fetch and stream the bytes.
+        // This avoids ffmpeg fetching googlevideo URLs directly (which often results in 403).
+        debug(`Streaming audio with yt-dlp for: ${song.url}`);
 
-      const formats = info.formats as YTDLVideoFormat[];
+        // Spawn yt-dlp as a streaming process and return its stdout as the audio stream.
+        // We request best audio and output to stdout (-o -).
+        const child = execa('yt-dlp', ['-f', 'ba', '-o', '-', '--no-playlist', song.url], {
+          timeout: 0,
+          // Allow large output; this is a streaming pipe.
+          maxBuffer: 1024 * 1024 * 50,
+        });
 
-      const filter = (format: ytdl.videoFormat): boolean => format.codecs === 'opus' && format.container === 'webm' && format.audioSampleRate !== undefined && parseInt(format.audioSampleRate, 10) === 48000;
+        // Ensure the process doesn't hang indefinitely.
+        const killTimer = setTimeout(() => {
+          child.kill('SIGKILL');
+        }, 10 * 60 * 1000); // 10 minutes
 
-      format = formats.find(filter);
+        child.on('exit', code => {
+          clearTimeout(killTimer);
+          debug(`[yt-dlp] exit ${code ?? 'unknown'}`);
+        });
 
-      const nextBestFormat = (formats: ytdl.videoFormat[]): ytdl.videoFormat | undefined => {
-        if (formats.length < 1) {
-          return undefined;
+        // If yt-dlp writes anything to stderr, surface it.
+        child.stderr?.on('data', (b: Buffer) => {
+          const line = b.toString('utf8').trim();
+          if (line) debug(`[yt-dlp:stderr] ${line}`);
+        });
+
+        if (!child.stdout) {
+          throw new Error('yt-dlp did not provide stdout stream');
         }
 
-        if (formats[0].isLive) {
-          formats = formats.sort((a, b) => (b as unknown as {audioBitrate: number}).audioBitrate - (a as unknown as {audioBitrate: number}).audioBitrate); // Bad typings
+        shouldCacheVideo = false;
+        // Return stream directly; createAudioResource expects WebmOpus.
+        // Many YouTube BA formats are opus/webm; if not, we'll fall back to ffmpeg on the raw URL path.
+        // (If this proves inconsistent, we can transcode with ffmpeg explicitly.)
+        return child.stdout;
+      } else {
+        // Not yet cached, must download
+        const info = await ytdl.getInfo(song.url);
 
-          return formats.find(format => [128, 127, 120, 96, 95, 94, 93].includes(parseInt(format.itag as unknown as string, 10))); // Bad typings
-        }
+        const formats = info.formats as YTDLVideoFormat[];
 
-        formats = formats
-          .filter(format => format.averageBitrate)
-          .sort((a, b) => {
-            if (a && b) {
-              return b.averageBitrate! - a.averageBitrate!;
-            }
+        const filter = (format: ytdl.videoFormat): boolean => format.codecs === 'opus' && format.container === 'webm' && format.audioSampleRate !== undefined && parseInt(format.audioSampleRate, 10) === 48000;
 
-            return 0;
-          });
-        return formats.find(format => !format.bitrate) ?? formats[0];
-      };
+        format = formats.find(filter);
 
-      if (!format) {
-        format = nextBestFormat(info.formats);
+        const nextBestFormat = (formats: ytdl.videoFormat[]): ytdl.videoFormat | undefined => {
+          if (formats.length < 1) {
+            return undefined;
+          }
+
+          if (formats[0].isLive) {
+            formats = formats.sort((a, b) => (b as unknown as {audioBitrate: number}).audioBitrate - (a as unknown as {audioBitrate: number}).audioBitrate); // Bad typings
+
+            return formats.find(format => [128, 127, 120, 96, 95, 94, 93].includes(parseInt(format.itag as unknown as string, 10))); // Bad typings
+          }
+
+          formats = formats
+            .filter(format => format.averageBitrate)
+            .sort((a, b) => {
+              if (a && b) {
+                return b.averageBitrate! - a.averageBitrate!;
+              }
+
+              return 0;
+            });
+          return formats.find(format => !format.bitrate) ?? formats[0];
+        };
 
         if (!format) {
-          // If still no format is found, throw
-          throw new Error('Can\'t find suitable format.');
+          format = nextBestFormat(info.formats);
+
+          if (!format) {
+            // If still no format is found, throw
+            throw new Error('Can\'t find suitable format.');
+          }
         }
+
+        debug('Using format', format);
+
+        ffmpegInput = format.url;
+
+        // Don't cache livestreams or long videos
+        const MAX_CACHE_LENGTH_SECONDS = 30 * 60; // 30 minutes
+        shouldCacheVideo = !info.player_response.videoDetails.isLiveContent && parseInt(info.videoDetails.lengthSeconds, 10) < MAX_CACHE_LENGTH_SECONDS && !options.seek;
+
+        debug(shouldCacheVideo ? 'Caching video' : 'Not caching video');
       }
-
-      debug('Using format', format);
-
-      ffmpegInput = format.url;
-
-      // Don't cache livestreams or long videos
-      const MAX_CACHE_LENGTH_SECONDS = 30 * 60; // 30 minutes
-      shouldCacheVideo = !info.player_response.videoDetails.isLiveContent && parseInt(info.videoDetails.lengthSeconds, 10) < MAX_CACHE_LENGTH_SECONDS && !options.seek;
-
-      debug(shouldCacheVideo ? 'Caching video' : 'Not caching video');
 
       ffmpegInputOptions.push(...[
         '-reconnect',
@@ -677,20 +748,54 @@ export default class {
       const returnedStream = capacitor.createReadStream();
       let hasReturnedStreamClosed = false;
 
+      const httpBypassHeaders = [
+        // YouTube (googlevideo) frequently requires a browser-like UA/referer; otherwise it can return 403.
+        '-user_agent',
+        'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
+        '-referer',
+        'https://www.youtube.com/',
+        '-headers',
+        'Origin: https://www.youtube.com\r\n',
+      ];
+
+      const inputOpts = [...(options?.ffmpegInputOptions ?? ['-re'])];
+      if (options.url.includes('googlevideo.com/videoplayback')) {
+        inputOpts.push(...httpBypassHeaders);
+      }
+
       const stream = ffmpeg(options.url)
-        .inputOptions(options?.ffmpegInputOptions ?? ['-re'])
+        .inputOptions(inputOpts)
         .noVideo()
         .audioCodec('libopus')
         .outputFormat('webm')
         .addOutputOption(['-filter:a', `volume=${options?.volumeAdjustment ?? '1'}`])
+        .on('start', command => {
+          debug(`Spawned ffmpeg with ${command}`);
+        })
+        // fluent-ffmpeg supports emitting stderr lines; surfacing them makes silent failures debuggable.
+        .on('stderr', (line: string) => {
+          debug(`[ffmpeg:stderr] ${line}`);
+        })
+        .on('end', () => {
+          debug('[ffmpeg] end');
+        })
         .on('error', error => {
+          debug(`[ffmpeg] error: ${(error as Error).message}`);
           if (!hasReturnedStreamClosed) {
             reject(error);
           }
-        })
-        .on('start', command => {
-          debug(`Spawned ffmpeg with ${command}`);
         });
+
+      // Log whether we ever see any audio bytes.
+      returnedStream.once('data', (chunk: Buffer) => {
+        debug(`[stream] first bytes from ffmpeg: ${chunk.length}`);
+      });
+      returnedStream.on('end', () => {
+        debug('[stream] end');
+      });
+      returnedStream.on('error', (err: Error) => {
+        debug(`[stream] error: ${err.message}`);
+      });
 
       stream.pipe(capacitor);
 
